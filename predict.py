@@ -1,128 +1,123 @@
-import os
 from typing import List
 
-import torch
-from diffusers import (
-    StableDiffusionPipeline,
-    StableDiffusionImg2ImgPipeline,
-    PNDMScheduler,
-    LMSDiscreteScheduler,
-    DDIMScheduler,
-    EulerDiscreteScheduler,
-    EulerAncestralDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-)
+from PIL.Image import LANCZOS
 from PIL import Image
+import qrcode
+import torch
 from cog import BasePredictor, Input, Path
+from diffusers import StableDiffusionControlNetPipeline, EulerDiscreteScheduler
 
-MODEL_ID = "stabilityai/stable-diffusion-2-1"
-MODEL_CACHE = "diffusers-cache"
+
+CACHE_DIR = "hf-cache"
+
+
+def resize_for_condition_image(input_image, width, height):
+    input_image = input_image.convert("RGB")
+    W, H = input_image.size
+    k = float(min(width, height)) / min(H, W)
+    H *= k
+    W *= k
+    H = int(round(H / 64.0)) * 64
+    W = int(round(W / 64.0)) * 64
+    img = input_image.resize((W, H), resample=LANCZOS)
+    return img
 
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading pipeline...")
-        self.txt2img_pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
+        # torch.backends.cuda.matmul.allow_tf32 = True
+        self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            CACHE_DIR, torch_dtype=torch.float16
         ).to("cuda")
-        self.img2img_pipe = StableDiffusionImg2ImgPipeline(
-            vae=self.txt2img_pipe.vae,
-            text_encoder=self.txt2img_pipe.text_encoder,
-            tokenizer=self.txt2img_pipe.tokenizer,
-            unet=self.txt2img_pipe.unet,
-            scheduler=self.txt2img_pipe.scheduler,
-            safety_checker=self.txt2img_pipe.safety_checker,
-            feature_extractor=self.txt2img_pipe.feature_extractor,
-        ).to("cuda")
+        self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+            self.pipe.scheduler.config
+        )
+        self.pipe.enable_xformers_memory_efficient_attention()
 
-    @torch.inference_mode()
+    def generate_qrcode(self, qr_code_content, background, border, width, height):
+        print("Generating QR Code from content")
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=10,
+            border=border,
+        )
+        qr.add_data(qr_code_content)
+        qr.make(fit=True)
+
+        qrcode_image = qr.make_image(fill_color="black", back_color=background)
+        qrcode_image = resize_for_condition_image(qrcode_image, width, height)
+        return qrcode_image
+
+    # Define the arguments and types the model takes as input
     def predict(
         self,
-        prompt: str = Input(
-            description="Input prompt",
-            default="A fantasy landscape, trending on artstation",
+        prompt: str = Input(description="The prompt to guide QR Code generation."),
+        qr_code_content: str = Input(
+            description="The website/content your QR Code will point to."
         ),
         negative_prompt: str = Input(
-            description="The prompt NOT to guide the image generation. Ignored when not using guidance",
-            default=None,
-        ),
-        image: Path = Input(
-            description="Inital image to generate variations of.",
-        ),
-        width: int = Input(
-            description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
-            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
-            default=512,
-        ),
-        height: int = Input(
-            description="Height of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
-            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
-            default=512,
-        ),
-        prompt_strength: float = Input(
-            description="Prompt strength when providing the image. 1.0 corresponds to full destruction of information in init image",
-            default=0.8,
-        ),
-        num_outputs: int = Input(
-            description="Number of images to output. Higher number of outputs may OOM.",
-            ge=1,
-            le=8,
-            default=1,
+            description="The negative prompt to guide image generation.",
+            default="ugly, disfigured, low quality, blurry, nsfw",
         ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps", ge=1, le=500, default=25
+            description="Number of diffusion steps", ge=20, le=100, default=40
         ),
         guidance_scale: float = Input(
-            description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
+            description="Scale for classifier-free guidance",
+            default=7.5,
+            ge=0.1,
+            le=30.0,
         ),
-        scheduler: str = Input(
-            default="DPMSolverMultistep",
-            choices=["DDIM", "K_EULER", "DPMSolverMultistep", "K_EULER_ANCESTRAL", "PNDM", "KLMS"],
-            description="Choose a scheduler.",
+        seed: int = Input(description="Seed", default=-1),
+        width: int = Input(description="Width out the output image", default=768),
+        height: int = Input(description="Height out the output image", default=768),
+        num_outputs: int = Input(
+            description="Number of outputs", ge=1, le=4, default=1
         ),
-        seed: int = Input(
-            description="Random seed. Leave blank to randomize the seed", default=None
+        image: Path = Input(
+            description="Input image. If none is provided, a QR code will be generated",
+            default=None,
+        ),
+        controlnet_conditioning_scale: float = Input(
+            description="The outputs of the controlnet are multiplied by `controlnet_conditioning_scale` before they are added to the residual in the original unet.",
+            ge=0.0,
+            le=4.0,
+            default=2.2,
+        ),
+        border: int = Input(description="QR code border size", ge=0, le=4, default=1),
+        qrcode_background: str = Input(
+            description="Background color of raw QR code",
+            choices=["gray", "white"],
+            default="gray",
         ),
     ) -> List[Path]:
-        """Run a single prediction on the model"""
-        if seed is None:
-            seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
-
-        pipe = self.img2img_pipe
-        extra_kwargs = {
-            "image": Image.open(image).convert("RGB"),
-            "strength": prompt_strength,
-        }
-        pipe.scheduler = make_scheduler(scheduler, pipe.scheduler.config)
-
-        generator = torch.Generator("cuda").manual_seed(seed)
-        output = pipe(
-            prompt=[prompt] * num_outputs if prompt is not None else None,
+        seed = torch.randint(0, 2**32, (1,)).item() if seed == -1 else seed
+        if image is None:
+            if qrcode_background == "gray":
+                qrcode_background = "#808080"
+            image = self.generate_qrcode(
+                qr_code_content, background=qrcode_background, border=border, width=width, height=height,
+            )
+        else:
+            image = Image.open(str(image))
+        out = self.pipe(
+            prompt=[prompt] * num_outputs,
+            negative_prompt=[negative_prompt] * num_outputs,
+            image=[image] * num_outputs,
+            width=width,
+            height=height,
             guidance_scale=guidance_scale,
-            generator=generator,
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
+            generator=torch.Generator().manual_seed(seed),
             num_inference_steps=num_inference_steps,
-            **extra_kwargs,
         )
 
-        output_paths = []
-        for i, sample in enumerate(output.images):
-            output_path = f"/tmp/out-{i}.png"
-            sample.save(output_path)
-            output_paths.append(Path(output_path))
+        outputs = []
+        for i, image in enumerate(out.images):
+            fname = f"output-{i}.png"
+            image.save(fname)
+            outputs.append(Path(fname))
 
-        return output_paths
-
-
-def make_scheduler(name, config):
-    return {
-        "PNDM": PNDMScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "DDIM": DDIMScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-    }[name]
+        return outputs
